@@ -1,6 +1,6 @@
 {
   "name": "letterboxd-friend-recs",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Userscript: film recommendations from the people you follow on Letterboxd.",
   "private": true,
   "type": "module",

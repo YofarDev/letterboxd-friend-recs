@@ -97,7 +97,11 @@ async function setup() {
   window.HTMLElement.prototype.scrollIntoView = () => {};
   window.fetch = async (path) => {
     const m = String(path).match(/^\/film\/s(\d+)\/$/);
-    if (m) { stats.filmFetches++; return new Response(filmPage(+m[1]), { status: 200 }); }
+    if (m) {
+      stats.filmFetches++;
+      await new Promise((r) => setTimeout(r, 3)); // a little latency, like the real site
+      return new Response(filmPage(+m[1]), { status: 200 });
+    }
     return new Response('', { status: 404 });
   };
   window.eval(SCRIPT);
@@ -150,7 +154,21 @@ async function setup() {
 
 test('recs page end to end', async (t) => {
   const ui = await setup();
+  // While the first page is loading, posters should appear one by one, not in a few big jumps
+  // (one jump per batch of 50). Record every distinct count of real posters seen while busy.
+  const isRealPoster = (img) => /\/p\d+\.jpg$/.test(img.getAttribute('src') || '');
+  const countsWhileLoading = new Set();
+  for (let i = 0; i < 2000; i++) {
+    await new Promise((r) => setTimeout(r, 2));
+    const root = ui.$('.lfr-page');
+    if (root && !root.dataset.busy && countsWhileLoading.size) break;
+    if (root?.dataset.busy) countsWhileLoading.add(ui.$$('.lfr-page img.image').filter(isRealPoster).length);
+  }
   await ui.settle();
+
+  await t.test('posters appear progressively while loading', () => {
+    assert.ok(countsWhileLoading.size >= 10, `poster count went through ${countsWhileLoading.size} values: ${[...countsWhileLoading].join(', ')}`);
+  });
 
   await t.test('opens as a native page on the watchlist route', () => {
     assert.ok(ui.$('.lfr-page'), 'page is rendered');

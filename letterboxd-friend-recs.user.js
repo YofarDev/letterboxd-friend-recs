@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Letterboxd — Friend recommendations
 // @namespace    yofardev.letterboxd-friend-recs
-// @version      2.0.1
+// @version      2.0.2
 // @description  Recommends films you haven't watched, scored from the ratings of the people you follow, how many of them watched it, and the global Letterboxd average. Data is cached in IndexedDB and synced incrementally.
 // @homepageURL  https://github.com/YofarDev/letterboxd-friend-recs
 // @supportURL   https://github.com/YofarDev/letterboxd-friend-recs/issues
@@ -315,7 +315,7 @@
         f.globalAt = now;
         films.set(f.slug, f);
       } catch (err) { console.warn('[friend-recs] details failed', f.slug, err); }
-      onOne?.();
+      onOne?.(f);
     }));
     await idb.putMany('films', todo);
     return todo.length;
@@ -449,7 +449,10 @@
     .lfr-page .lfr-ph{display:block;width:100%;aspect-ratio:2/3;background:#2c3440;border-radius:4px}
     .lfr-page .lfr-vd{display:flex;gap:6px;align-items:center;margin:4px 0 0;font-size:11px;line-height:16px;color:#678;white-space:nowrap;overflow:hidden}
     .lfr-page .lfr-vd .lfr-stars{color:#89a;font-size:12px;letter-spacing:-.05em}
-    .lfr-page .lfr-vd .lfr-wl{width:6px;height:6px;border-radius:50%;background:#40bcf4;flex:none}
+    .lfr-page .film-poster{position:relative}
+    .lfr-page .lfr-wl{position:absolute;top:6px;right:6px;z-index:3;width:9px;height:9px;border-radius:50%;background:#40bcf4;box-shadow:0 0 0 2px rgba(20,24,28,.85);pointer-events:none}
+    .lfr-page img.lfr-img{opacity:0;transition:opacity .25s ease}
+    .lfr-page img.lfr-img.lfr-in{opacity:1}
     .lfr-page .lfr-note{margin:18px 0;color:#9ab;font-size:13px;line-height:1.6}
     .lfr-page .lfr-note:empty{display:none}
     .lfr-page .lfr-link{background:none;border:0;padding:0;font:inherit;color:#40bcf4;cursor:pointer}
@@ -743,7 +746,10 @@
           };
           render();
           showProgress();
-          await ensureGlobals(films, need, () => { if (t !== token) return; if (scanning) checked++; showProgress(); });
+          await ensureGlobals(films, need, (f) => {
+            if (t !== token) return;
+            if (scanning) { checked++; showProgress(); } else updatePoster(f);
+          });
           if (t !== token) return;
           ranked = rank(prep, films, watchlist, w);
           render();
@@ -751,6 +757,27 @@
       } finally {
         if (t === token) { busyNote = ''; refreshing = false; updateBusy(); render(); }
       }
+    }
+
+    // Poster image that fades in once loaded (placeholders and real posters alike).
+    // Already-loaded posters are shown straight away, so re-rendering the grid never flickers.
+    const loadedSrcs = new Set();
+    function posterImg(src, title) {
+      if (!src) return el('span', { class: 'lfr-ph' });
+      const seen = loadedSrcs.has(src);
+      const img = el('img', { class: `image lfr-img${seen ? ' lfr-in' : ''}`, width: 125, height: 187, alt: `Poster for ${title}`, loading: 'lazy' });
+      if (!seen) img.addEventListener('load', () => { loadedSrcs.add(src); img.classList.add('lfr-in'); });
+      img.src = src;
+      return img;
+    }
+
+    // Swap in a film's poster as soon as its details arrive, without waiting for the rest of the page.
+    function updatePoster(f) {
+      if (!f?.image) return;
+      const li = grid.querySelector(`li[data-slug="${f.slug}"]`);
+      const old = li?.querySelector('.film-poster > img, .film-poster > .lfr-ph');
+      if (!old || old.getAttribute('src') === f.image) return;
+      old.replaceWith(posterImg(f.image, old.getAttribute('alt')?.replace(/^Poster for /, '') || f.name || f.slug));
     }
 
     function card(r) {
@@ -768,16 +795,15 @@
         ...raters.slice(0, 12),
         raters.length > 12 ? `+${raters.length - 12} more` : null,
       ].filter((x) => x != null).join('\n');
-      const img = f.image || emptyPoster;
       return el('li', { class: 'griditem', 'data-slug': r.slug }, [
         el('div', { class: 'poster film-poster' }, [
-          img ? el('img', { class: 'image', src: img, width: 125, height: 187, alt: `Poster for ${title}`, loading: 'lazy' }) : el('span', { class: 'lfr-ph' }),
+          posterImg(f.image || emptyPoster, title),
           el('a', { class: 'frame', href: `/film/${r.slug}/`, title: tip }, [el('span', { class: 'frame-title', text: title }), el('span', { class: 'overlay' })]),
+          r.inWl ? el('span', { class: 'lfr-wl' }) : null,
         ]),
         el('p', { class: 'poster-viewingdata lfr-vd', title: tip }, [
           r.friendAvg != null ? el('span', { class: 'lfr-stars', text: stars(r.friendAvg) }) : null,
           el('span', { text: plural(r.n, 'friend') }),
-          r.inWl ? el('span', { class: 'lfr-wl', title: 'In your watchlist' }) : null,
         ]),
       ]);
     }
