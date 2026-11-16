@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Letterboxd — Friend recommendations
 // @namespace    yofardev.letterboxd-friend-recs
-// @version      2.0.0
+// @version      2.0.1
 // @description  Recommends films you haven't watched, scored from the ratings of the people you follow, how many of them watched it, and the global Letterboxd average. Data is cached in IndexedDB and synced incrementally.
 // @homepageURL  https://github.com/YofarDev/letterboxd-friend-recs
 // @supportURL   https://github.com/YofarDev/letterboxd-friend-recs/issues
@@ -460,12 +460,12 @@
     .lfr-page .lfr-tune label b{color:#def;font-weight:400}
     .lfr-page .lfr-tune input[type=range]{width:100%;accent-color:#00e054}
     .lfr-page .lfr-tune p{margin:2px 0 0;font-size:11px;color:#678;line-height:1.4}
-    .lfr-menu .lfr-menu-heading{display:block;padding:8px 12px 2px;font-size:10px;letter-spacing:.075em;text-transform:uppercase;opacity:.65}
+    .lfr-menu .lfr-menu-heading{display:block;padding:8px 12px 2px;font-size:10px;letter-spacing:.075em;text-transform:uppercase;color:#2c3440}
     .lfr-menu li.lfr-on > a.item, .lfr-menu li.lfr-ex > a.item{font-weight:600}
     .lfr-menu li.lfr-on > a.item::after{content:' ✓'}
     .lfr-menu li.lfr-ex > a.item{text-decoration:line-through}
     .lfr-menu li.lfr-ex > a.item::after{content:' ✕';display:inline-block;text-decoration:none}
-    .lfr-menu .lfr-menu-hint{display:block;padding:6px 12px 8px;font-size:11px;opacity:.7}
+    .lfr-menu .lfr-menu-hint{display:block;padding:6px 12px 8px;font-size:11px;color:#2c3440}
   `;
 
   function el(tag, attrs = {}, children = []) {
