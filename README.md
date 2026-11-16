@@ -34,7 +34,7 @@ The first sync reads your friends' films once (a few minutes). After that it onl
 ## Privacy & fair use
 
 - Everything stays in your browser. The script only talks to letterboxd.com.
-- Unofficial, not affiliated with Letterboxd. Requests are deliberately slow (1–2 at a time, with pauses) and incremental. Please keep it that way.
+- Unofficial, not affiliated with Letterboxd. Requests are deliberately slow (1–2 at a time, with pauses) and incremental. If Letterboxd rate-limits (HTTP 429), everything pauses for as long as it asks and then continues more slowly, so large networks just take longer to sync. Please keep it that way.
 
 ## Development
 

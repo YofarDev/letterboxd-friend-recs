@@ -85,19 +85,28 @@ const PAGE_HTML = `<!doctype html><html><head></head><body>
   </div></div>
 </body></html>`;
 
-async function setup() {
+// rateLimit: { afterRequests, times, retryAfter } makes the fake site answer HTTP 429
+// (with Retry-After) `times` times, starting after `afterRequests` successful film requests.
+async function setup({ rateLimit = null } = {}) {
   const idb = new IDBFactory();
   await seed(idb);
   const dom = new JSDOM(PAGE_HTML, { url: 'https://letterboxd.com/me/watchlist/#friend-recs', runScripts: 'outside-only', pretendToBeVisual: true });
   const { window } = dom;
-  const stats = { filmFetches: 0 };
+  const stats = { filmFetches: 0, calls: [], limited: [] };
   window.indexedDB = idb;
   window.IDBKeyRange = IDBKeyRange;
   window.person = { loggedIn: true, username: 'Me' };
   window.HTMLElement.prototype.scrollIntoView = () => {};
+  let limitsLeft = rateLimit?.times ?? 0;
   window.fetch = async (path) => {
     const m = String(path).match(/^\/film\/s(\d+)\/$/);
     if (m) {
+      stats.calls.push(Date.now());
+      if (rateLimit && stats.filmFetches >= rateLimit.afterRequests && limitsLeft > 0) {
+        limitsLeft--;
+        stats.limited.push(Date.now());
+        return new Response('', { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfter) } });
+      }
       stats.filmFetches++;
       await new Promise((r) => setTimeout(r, 3)); // a little latency, like the real site
       return new Response(filmPage(+m[1]), { status: 200 });
@@ -258,4 +267,27 @@ test('recs page end to end', async (t) => {
     assert.ok(!ui.$('.js-watchlist-content').classList.contains('lfr-hidden'));
     assert.ok(ui.$('.js-page-watchlist').classList.contains('-active'));
   });
+});
+
+test('rate limits (HTTP 429) pause the whole queue, then everything still loads', async () => {
+  const ui = await setup({ rateLimit: { afterRequests: 45, times: 2, retryAfter: 1 } });
+  let sawNotice = false;
+  for (let i = 0; i < 3000; i++) { // up to ~30 s
+    await new Promise((r) => setTimeout(r, 10));
+    const notice = ui.$('[data-lfr="throttle"]');
+    if (notice && !notice.classList.contains('lfr-hidden') && /slow down/.test(notice.textContent)) sawNotice = true;
+    const root = ui.$('.lfr-page');
+    if (root && !root.dataset.busy && ui.stats.limited.length === 2) break;
+  }
+  await ui.settle();
+
+  assert.equal(ui.stats.limited.length, 2, 'the fake site rate-limited twice');
+  assert.ok(sawNotice, 'the "Letterboxd asked us to slow down" notice was shown');
+  // After a 429 with Retry-After: 1, nothing at all is requested for that second (not even by the other slot).
+  for (const t0 of ui.stats.limited) {
+    const during = ui.stats.calls.filter((t) => t > t0 + 50 && t < t0 + 950);
+    assert.equal(during.length, 0, `no requests during the pause after the 429 at +${t0 - ui.stats.calls[0]} ms`);
+  }
+  assert.equal(ui.slugs().length, 50, 'the page still filled up');
+  assert.ok(ui.$('[data-lfr="throttle"]').classList.contains('lfr-hidden'), 'notice hidden again after resuming');
 });

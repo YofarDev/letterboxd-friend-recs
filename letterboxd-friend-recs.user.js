@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Letterboxd — Friend recommendations
 // @namespace    yofardev.letterboxd-friend-recs
-// @version      2.0.2
+// @version      2.1.0
 // @description  Recommends films you haven't watched, scored from the ratings of the people you follow, how many of them watched it, and the global Letterboxd average. Data is cached in IndexedDB and synced incrementally.
 // @homepageURL  https://github.com/YofarDev/letterboxd-friend-recs
 // @supportURL   https://github.com/YofarDev/letterboxd-friend-recs/issues
@@ -22,7 +22,12 @@
   const CFG = {
     concurrency: 2,          // parallel requests to letterboxd.com
     minGapMs: 350,           // minimum delay between request starts (be gentle)
-    maxRetries: 4,
+    maxGapMs: 3000,          // after rate limits the delay grows up to this…
+    gapRecoverAfter: 20,     // …and shrinks again after this many successful requests in a row
+    rateLimitWaitMs: 30000,  // pause after an HTTP 429 without a Retry-After header
+    maxRateLimitWaitMs: 300000,
+    maxRateLimitRetries: 20, // a single request gives up after this many 429s (that's a long throttle)
+    maxRetries: 4,           // other errors (5xx, network)
     deltaEveryHours: 6,      // re-check a friend's latest ratings at most this often if their watched count is unchanged
     fullRefreshDays: 30,     // full re-crawl of a friend after this many days (catches deleted ratings)
     fullRefreshPerRun: 2,    // at most this many full re-crawls per sync (rotation)
@@ -94,27 +99,64 @@
 
   // ---------- Polite fetch queue ----------
   // Two lanes: results-page requests (posters, global ratings) jump ahead of a running sync.
+  // Rate limits (HTTP 429) pause the *whole* queue for as long as Letterboxd asks (Retry-After),
+  // and slow it down: the gap between requests doubles after each 429 and eases back after a run
+  // of successful requests.
   let active = 0, nextStart = 0, fetchedPages = 0;
+  let gapMs = CFG.minGapMs, pausedUntil = 0, okStreak = 0;
   const waiters = { high: [], low: [] };
+  const throttleListeners = new Set();
+  const onThrottle = (fn) => { throttleListeners.add(fn); return () => throttleListeners.delete(fn); };
+
   async function acquire(priority) {
     while (active >= CFG.concurrency) await new Promise((r) => waiters[priority ? 'high' : 'low'].push(r));
     active++;
-    const now = Date.now();
-    nextStart = Math.max(now, nextStart + CFG.minGapMs);
-    if (nextStart > now) await sleep(nextStart - now);
+    for (;;) {
+      const now = Date.now();
+      if (pausedUntil > now) { await sleep(pausedUntil - now); continue; }
+      nextStart = Math.max(now, nextStart + gapMs);
+      if (nextStart > now) await sleep(nextStart - now);
+      if (pausedUntil <= Date.now()) return; // a pause may have started while we were waiting
+    }
   }
   function release() { active--; (waiters.high.shift() || waiters.low.shift())?.(); }
 
+  function retryAfterMs(res) {
+    const h = res.headers.get('retry-after');
+    if (!h) return CFG.rateLimitWaitMs;
+    const ms = Number.isFinite(Number(h)) ? Number(h) * 1000 : Date.parse(h) - Date.now();
+    return Number.isFinite(ms) ? clamp(ms, 1000, CFG.maxRateLimitWaitMs) : CFG.rateLimitWaitMs;
+  }
+  function onRateLimited(res) {
+    pausedUntil = Math.max(pausedUntil, Date.now() + retryAfterMs(res));
+    gapMs = Math.min(CFG.maxGapMs, Math.max(250, gapMs * 2));
+    okStreak = 0;
+    throttleListeners.forEach((fn) => fn({ until: pausedUntil, gapMs }));
+  }
+  function onSuccess() {
+    if (gapMs > CFG.minGapMs && ++okStreak >= CFG.gapRecoverAfter) {
+      gapMs = Math.max(CFG.minGapMs, Math.round(gapMs / 1.5));
+      okStreak = 0;
+    }
+  }
+
   async function fetchText(path, priority = false) {
-    for (let attempt = 0; ; attempt++) {
+    let errors = 0, limits = 0;
+    for (;;) {
       await acquire(priority);
       let res = null;
       try { res = await fetch(path, { credentials: 'same-origin' }); } catch { /* network error: retry */ }
       finally { release(); }
-      if (res?.ok) { fetchedPages++; return res.text(); }
+      if (res?.ok) { fetchedPages++; onSuccess(); return res.text(); }
       if (res && (res.status === 404 || res.status === 403)) return null;
-      if (attempt >= CFG.maxRetries) throw new Error(`HTTP ${res?.status ?? 'network'} for ${path}`);
-      await sleep(2000 * 2 ** attempt); // 429 / 5xx: back off
+      if (res && (res.status === 429 || (res.status === 503 && res.headers.has('retry-after')))) {
+        // Rate limited: everyone waits, then this request is retried. Only give up after a very long throttle.
+        if (++limits > CFG.maxRateLimitRetries) throw new Error(`Rate limited by Letterboxd for too long (${path})`);
+        onRateLimited(res);
+        continue;
+      }
+      if (++errors > CFG.maxRetries) throw new Error(`HTTP ${res?.status ?? 'network'} for ${path}`);
+      await sleep(2000 * 2 ** (errors - 1)); // other errors: back off this request only
     }
   }
 
@@ -454,6 +496,7 @@
     .lfr-page img.lfr-img{opacity:0;transition:opacity .25s ease}
     .lfr-page img.lfr-img.lfr-in{opacity:1}
     .lfr-page .lfr-note{margin:18px 0;color:#9ab;font-size:13px;line-height:1.6}
+    .lfr-page .lfr-throttle{margin:-8px 0 24px;color:#ff8000;font-size:12px;line-height:1.5}
     .lfr-page .lfr-note:empty{display:none}
     .lfr-page .lfr-link{background:none;border:0;padding:0;font:inherit;color:#40bcf4;cursor:pointer}
     .lfr-page .lfr-link:hover{color:#fff}
@@ -677,8 +720,24 @@
       } })]),
     ]);
     tuneLink.addEventListener('click', (e) => { e.preventDefault(); tune.classList.toggle('lfr-hidden'); });
+    // "Letterboxd asked us to slow down" notice with a countdown, shown while the request queue is paused.
+    const throttleEl = el('p', { class: 'lfr-throttle lfr-hidden', 'data-lfr': 'throttle' });
+    let throttleTimer = null;
+    const showThrottle = ({ until }) => {
+      clearInterval(throttleTimer);
+      const tick = () => {
+        const s = Math.ceil((until - Date.now()) / 1000);
+        if (s <= 0) { clearInterval(throttleTimer); throttleEl.classList.add('lfr-hidden'); return; }
+        throttleEl.textContent = `Letterboxd asked us to slow down. Resuming in ${s} s…`;
+        throttleEl.classList.remove('lfr-hidden');
+      };
+      tick();
+      throttleTimer = setInterval(tick, 1000);
+    };
+    const stopThrottleUpdates = onThrottle(showThrottle);
     const sidebar = el('aside', { class: 'sidebar' }, [
       el('section', { class: 'actions-panel', 'data-theme': 'panel' }, [el('ul', {}, [el('li', {}, [syncLink]), clearItem, el('li', {}, [tuneLink])])]),
+      throttleEl,
       tune,
       el('section', { class: 'section panel-text' }, [el('h3', { class: 'section-heading', text: 'How it works' }), about]),
     ]);
@@ -906,7 +965,7 @@
       await refresh();
       if (prep && (!lastSync || Date.now() - lastSync > CFG.autoSyncHours * HOUR)) sync();
     };
-    return { root, start, destroy: () => { token++; menus.forEach((m) => m.close()); root.remove(); } };
+    return { root, start, destroy: () => { token++; menus.forEach((m) => m.close()); stopThrottleUpdates(); clearInterval(throttleTimer); root.remove(); } };
   }
 
   // ---------- Routing + entry points ----------
