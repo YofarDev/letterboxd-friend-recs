@@ -3,6 +3,11 @@
 // @namespace    yofardev.letterboxd-friend-recs
 // @version      2.0.0
 // @description  Recommends films you haven't watched, scored from the ratings of the people you follow, how many of them watched it, and the global Letterboxd average. Data is cached in IndexedDB and synced incrementally.
+// @homepageURL  https://github.com/YofarDev/letterboxd-friend-recs
+// @supportURL   https://github.com/YofarDev/letterboxd-friend-recs/issues
+// @updateURL    https://raw.githubusercontent.com/YofarDev/letterboxd-friend-recs/main/letterboxd-friend-recs.user.js
+// @downloadURL  https://raw.githubusercontent.com/YofarDev/letterboxd-friend-recs/main/letterboxd-friend-recs.user.js
+// @license      MIT
 // @match        https://letterboxd.com/*
 // @grant        none
 // @inject-into  page

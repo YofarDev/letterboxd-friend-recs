@@ -20,7 +20,7 @@ It runs entirely in your browser, on letterboxd.com, while you're signed in. The
 1. Install a userscript manager:
    - Chrome / Edge / Brave: [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/). In Chrome, Tampermonkey also needs **Allow User Scripts** turned on in `chrome://extensions` → Tampermonkey → Details (or **Developer mode** on older Chrome).
    - Firefox and forks (Zen, LibreWolf…): Tampermonkey or Violentmonkey.
-2. Open [`letterboxd-friend-recs.user.js`](letterboxd-friend-recs.user.js), click **Raw**, and let the manager install it. (Or create a new script and paste the file in.)
+2. **[Install the script](https://raw.githubusercontent.com/YofarDev/letterboxd-friend-recs/main/letterboxd-friend-recs.user.js)**: your userscript manager opens an install page. Updates are picked up automatically. (Or create a new script and paste [the file](letterboxd-friend-recs.user.js) in.)
 3. Sign in to [letterboxd.com](https://letterboxd.com) and open your profile. A **Recs** tab appears after Watchlist (the page lives at `letterboxd.com/<you>/watchlist/#friend-recs`).
 4. Click **Sync now** once. The first sync takes a few minutes. After that, the page syncs in the background whenever the last sync is more than 12 hours old, or when you click **Sync friends' films** in the sidebar.
 
