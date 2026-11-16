@@ -2,6 +2,8 @@
 
 A userscript that adds a **Recs** tab to your Letterboxd profile: films you haven't seen, recommended by the people you follow.
 
+![Friend recs in the Letterboxd account menu](docs/open-page.jpeg)
+
 ![Recs tab on a Letterboxd profile](docs/recs-page.jpg)
 
 ## Features
