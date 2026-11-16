@@ -67,16 +67,34 @@ async function seed(idb) {
   });
 }
 
+// A minimal copy of the watchlist page the recs page is hosted on: header account menu,
+// profile tabs, and the watchlist content (which the script hides).
+const PAGE_HTML = `<!doctype html><html><head></head><body>
+  <header><nav class="main-nav"><ul class="subnav">
+    <li><a href="/me/">Profile</a></li><li><a href="/me/watchlist/">Watchlist</a></li><li><a href="/me/lists/">Lists</a></li>
+  </ul></nav></header>
+  <div id="content"><div class="content-wrap">
+    <section class="profile-header"><nav class="profile-navigation"><ul class="navlist">
+      <li class="navitem js-page-films" data-owner="Me"><a class="navlink" href="/me/films/">Films</a></li>
+      <li class="navitem js-page-watchlist -active" data-owner="Me"><a class="navlink" href="/me/watchlist/">Watchlist</a></li>
+      <li class="navitem js-page-lists" data-owner="Me"><a class="navlink" href="/me/lists/">Lists</a></li>
+    </ul></nav></section>
+    <div class="cols-2 js-watchlist-content"><section class="col-main"><div class="poster-grid"><ul class="grid">
+      <li class="griditem"><div data-empty-poster-src="https://s.ltrbxd.com/empty.png"></div></li>
+    </ul></div></section></div>
+  </div></div>
+</body></html>`;
+
 async function setup() {
   const idb = new IDBFactory();
   await seed(idb);
-  const dom = new JSDOM('<!doctype html><html><head></head><body><header></header></body></html>',
-    { url: 'https://letterboxd.com/', runScripts: 'outside-only', pretendToBeVisual: true });
+  const dom = new JSDOM(PAGE_HTML, { url: 'https://letterboxd.com/me/watchlist/#friend-recs', runScripts: 'outside-only', pretendToBeVisual: true });
   const { window } = dom;
   const stats = { filmFetches: 0 };
   window.indexedDB = idb;
   window.IDBKeyRange = IDBKeyRange;
-  window.person = { loggedIn: true, username: 'me' };
+  window.person = { loggedIn: true, username: 'Me' };
+  window.HTMLElement.prototype.scrollIntoView = () => {};
   window.fetch = async (path) => {
     const m = String(path).match(/^\/film\/s(\d+)\/$/);
     if (m) { stats.filmFetches++; return new Response(filmPage(+m[1]), { status: 200 }); }
@@ -89,107 +107,137 @@ async function setup() {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const ui = {
     window, stats, $, $$,
-    // Wait until the status line stops saying it's fetching/checking and stays the same.
+    // Wait until the page isn't fetching or syncing and the grid has stopped changing.
     async settle() {
       let last = '', stable = 0;
       for (let i = 0; i < 600; i++) {
         await sleep(50);
-        const s = $('.lfr .status')?.textContent || '';
-        if (!/^(Fetching|Checking)/.test(s) && s === last) { if (++stable >= 6) return s; } else stable = 0;
-        last = s;
+        const root = $('.lfr-page');
+        const snapshot = root ? `${root.dataset.busy || ''}|${ui.slugs().join(',')}|${$('.lfr-page h1').textContent}` : '';
+        if (root && !root.dataset.busy && snapshot === last) { if (++stable >= 6) return; } else stable = 0;
+        last = snapshot;
       }
-      throw new Error(`results page never settled; last status: ${last}`);
+      throw new Error('recs page never settled');
     },
-    // Text of each card's meta lines, e.g. "1968 · 100 min · Someone | Drama · USA".
-    cards: () => $$('.lfr .card').map((c) => [...c.querySelectorAll('.meta')].map((m) => m.textContent).join(' | ')),
-    gridButtons: () => $$('.lfr .grid button').map((b) => b.textContent),
-    setCtrl(label, value) {
-      const l = $$('.lfr label').find((x) => x.firstChild?.textContent === label);
-      assert.ok(l, `control "${label}" exists`);
-      const input = l.querySelector('select, input');
-      input.value = value;
-      input.dispatchEvent(new window.Event('change'));
-    },
-    async showAll() {
-      for (let i = 0; i < 20; i++) {
-        const more = $$('.lfr .grid button').find((b) => b.textContent === 'Show more');
-        if (!more) return;
-        more.click();
+    // Film indexes shown on the current page (slugs are "s<index>").
+    slugs: () => $$('.lfr-page .poster-grid li.griditem').map((li) => +li.dataset.slug.slice(1)),
+    // Every film across all pages (walks the pagination, then goes back to page 1).
+    async all() {
+      const out = [...ui.slugs()];
+      for (let i = 0; i < 50; i++) {
+        const next = $('.lfr-page .pagination a.next');
+        if (!next) break;
+        next.click();
         await ui.settle();
+        out.push(...ui.slugs());
       }
+      const first = $$('.lfr-page .pagination .paginate-page a').find((a) => a.textContent === '1');
+      if (first) { first.click(); await ui.settle(); }
+      return out;
     },
+    // Pick an item in one of the Letterboxd-style dropdowns.
+    async pick(menuId, value) {
+      if (!$(`ul.lfr-menu[data-lfr-menu="${menuId}"]`)) $(`.lfr-page [data-lfr-menu="${menuId}"] .smenu label`).click();
+      const item = $(`ul.lfr-menu[data-lfr-menu="${menuId}"] a[data-value="${value}"]`);
+      assert.ok(item, `menu "${menuId}" has item "${value}"`);
+      item.click();
+      await ui.settle();
+    },
+    menuLabel: (menuId) => $(`.lfr-page [data-lfr-menu="${menuId}"] .smenu label`).textContent.trim(),
   };
   return ui;
 }
 
-test('results page end to end', async (t) => {
+test('recs page end to end', async (t) => {
   const ui = await setup();
-  assert.ok(ui.$('.lfr-btn'), 'button is mounted once the signed-in user is known');
-  ui.$('.lfr-btn').click();
   await ui.settle();
 
-  await t.test('default: films only, no shorts, no watched films', async () => {
-    assert.equal(ui.cards().length, 60, 'first page is full');
-    await ui.showAll();
-    const c = ui.cards();
-    assert.equal(c.length, candidates.filter(isFeature).length);
-    assert.equal(c.filter((m) => /Series|\b20 min/.test(m)).length, 0);
+  await t.test('opens as a native page on the watchlist route', () => {
+    assert.ok(ui.$('.lfr-page'), 'page is rendered');
+    assert.ok(ui.$('.js-watchlist-content').classList.contains('lfr-hidden'), 'watchlist content is hidden');
+    assert.ok(ui.$('.lfr-navitem.-active'), '"Recs" profile tab is added and active');
+    assert.ok(!ui.$('.js-page-watchlist').classList.contains('-active'), 'watchlist tab is no longer active');
+    assert.equal(ui.$('.lfr-subnav a').getAttribute('href'), '/me/watchlist/#friend-recs', 'account menu entry');
+    assert.match(ui.$('.lfr-page h1.section-heading').textContent, /^Your friends recommend \d+ films$/);
   });
 
-  await t.test('genre filter scans candidates, then offers "Check more"', async () => {
-    ui.setCtrl('Genre', 'Horror');
-    await ui.settle();
-    const expected = candidates.filter((i) => isFeature(i) && film(i).genres.includes('Horror')).length;
-    // First run checks at most 300 films, so it may stop short and offer a button.
-    const check = ui.$$('.lfr .grid button').find((b) => /^Check \d+ more films/.test(b.textContent));
-    if (check) { check.click(); await ui.settle(); }
-    const c = ui.cards();
-    assert.equal(c.length, expected);
-    assert.ok(c.every((m) => /Horror/.test(m)));
+  await t.test('default: films only, no shorts, no watched films, paginated', async () => {
+    assert.equal(ui.slugs().length, 50, 'first page is full');
+    const all = await ui.all();
+    assert.equal(all.length, candidates.filter(isFeature).length);
+    assert.equal(new Set(all).size, all.length, 'no duplicates across pages');
+    assert.ok(all.every((i) => isFeature(i) && i >= 10));
+  });
+
+  await t.test('genre filter checks candidates, then offers "Check more films"', async () => {
+    await ui.pick('genre', 'Horror');
+    assert.equal(ui.menuLabel('genre'), 'Horror');
+    const more = ui.$('[data-lfr="check-more"]');
+    if (more) { more.click(); await ui.settle(); }
+    const all = await ui.all();
+    assert.equal(all.length, candidates.filter((i) => isFeature(i) && film(i).genres.includes('Horror')).length);
+    assert.ok(all.every((i) => film(i).genres.includes('Horror')));
     assert.equal(ui.stats.filmFetches, candidates.length, 'every candidate fetched exactly once');
   });
 
   await t.test('genre + language', async () => {
-    ui.setCtrl('Language', 'French');
-    await ui.settle();
-    const expected = candidates.filter((i) => isFeature(i) && film(i).genres.includes('Horror') && film(i).langs.includes('fr')).length;
-    const c = ui.cards();
-    assert.equal(c.length, expected);
-    assert.ok(c.every((m) => /Horror/.test(m) && /France/.test(m)));
+    await ui.pick('language', 'fr');
+    const all = await ui.all();
+    assert.equal(all.length, candidates.filter((i) => isFeature(i) && film(i).genres.includes('Horror') && film(i).langs.includes('fr')).length);
   });
 
-  await t.test('language + year range', async () => {
-    ui.setCtrl('Genre', '');
-    ui.setCtrl('Year from', '2000');
-    ui.setCtrl('Year to', '2009');
-    await ui.settle();
-    const inRange = (i) => film(i).year >= 2000 && film(i).year <= 2009;
-    const expected = candidates.filter((i) => isFeature(i) && film(i).langs.includes('fr') && inRange(i)).length;
-    const c = ui.cards();
-    assert.equal(c.length, expected);
-    const years = c.map((m) => +m.match(/\b(19|20)\d\d\b/)[0]);
-    assert.ok(years.every((y) => y >= 2000 && y <= 2009));
+  await t.test('language + decade', async () => {
+    await ui.pick('genre', ''); // "Any genre"
+    await ui.pick('decade', '2000');
+    assert.equal(ui.menuLabel('decade'), '2000s');
+    const all = await ui.all();
+    const expected = candidates.filter((i) => isFeature(i) && film(i).langs.includes('fr') && film(i).year >= 2000 && film(i).year <= 2009);
+    assert.deepEqual([...all].sort((a, b) => a - b), expected);
   });
 
-  await t.test('exclude genre', async () => {
-    ui.setCtrl('Exclude genre', 'Drama');
-    await ui.settle();
-    const c = ui.cards();
-    assert.ok(c.length > 0);
-    assert.ok(c.every((m) => !/Drama/.test(m)));
+  await t.test('clicking a genre twice excludes it', async () => {
+    await ui.pick('genre', 'Drama');
+    await ui.pick('genre', 'Drama');
+    assert.equal(ui.menuLabel('genre'), 'Not Drama');
+    const all = await ui.all();
+    assert.ok(all.length > 0);
+    assert.ok(all.every((i) => !film(i).genres.includes('Drama')));
   });
 
-  await t.test('"Most watched" sort keeps all filters', async () => {
-    ui.setCtrl('Sort', 'watched');
-    await ui.settle();
-    assert.ok(ui.cards().every((m) => !/Drama/.test(m)));
-    assert.match(ui.$('.lfr .card .score').textContent, /watched/);
+  await t.test('"Other" menu: include series and shorts', async () => {
+    await ui.pick('genre', '');
+    await ui.pick('decade', '');
+    await ui.pick('language', '');
+    await ui.pick('other', 'kind:all');
+    await ui.pick('other', 'shorts');
+    const all = await ui.all();
+    assert.equal(all.length, candidates.length);
   });
 
-  await t.test('clear filters', async () => {
-    ui.$$('.lfr button').find((b) => b.textContent === 'Clear filters').click();
+  await t.test('sort menu', async () => {
+    await ui.pick('sort', 'watched');
+    assert.equal(ui.menuLabel('sort'), 'Most watched by friends');
+    assert.equal(ui.slugs().length, 50);
+  });
+
+  await t.test('clear filters resets filters but keeps view options', async () => {
+    await ui.pick('other', 'kind:movie');
+    await ui.pick('other', 'shorts');
+    await ui.pick('genre', 'Horror');
+    const clear = ui.$$('.lfr-page aside a').find((a) => a.textContent === 'Clear filters');
+    assert.ok(!clear.parentElement.classList.contains('lfr-hidden'), '"Clear filters" shows when filters are set');
+    clear.click();
     await ui.settle();
-    await ui.showAll();
-    assert.equal(ui.cards().length, candidates.filter(isFeature).length);
+    assert.equal(ui.menuLabel('genre'), 'Genre');
+    assert.ok(clear.parentElement.classList.contains('lfr-hidden'));
+    assert.equal((await ui.all()).length, candidates.filter(isFeature).length);
+  });
+
+  await t.test('leaving the route restores the watchlist', async () => {
+    ui.window.location.hash = '';
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(ui.$('.lfr-page'), null);
+    assert.ok(!ui.$('.js-watchlist-content').classList.contains('lfr-hidden'));
+    assert.ok(ui.$('.js-page-watchlist').classList.contains('-active'));
   });
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Letterboxd — Friend recommendations
 // @namespace    yofardev.letterboxd-friend-recs
-// @version      1.4.0
+// @version      2.0.0
 // @description  Recommends films you haven't watched, scored from the ratings of the people you follow, how many of them watched it, and the global Letterboxd average. Data is cached in IndexedDB and synced incrementally.
 // @match        https://letterboxd.com/*
 // @grant        none
@@ -23,11 +23,13 @@
     fullRefreshPerRun: 2,    // at most this many full re-crawls per sync (rotation)
     globalTtlDays: 30,       // refresh a shown film's global average after this long (genre/year/etc. never change)
     detailsVersion: 3,       // bump when the stored film details change shape, to refetch them
-    scanBatch: 60,           // genre/country/language filters: film pages checked per round…
+    scanBatch: 20,           // genre/country/language filters: film pages checked per round…
     scanPerRun: 300,         // …and at most this many per filter change (then a "Check more" button)
-    pageSize: 60,            // cards shown per "Show more"
+    pageSize: 50,            // posters per page (5 per row)
+    shortMinutes: 60,        // "Hide shorts" hides anything shorter than this
+    autoSyncHours: 12,       // opening the page syncs in the background if the last sync is older than this
     dbName: 'lbxFriendRecs',
-    prefsKey: 'lbxFriendRecs:weights',
+    prefsKey: 'lbxFriendRecs:prefs',
   };
   const DEFAULT_WEIGHTS = {
     k: 2,            // pull toward the global average (in "friend ratings" worth)
@@ -36,16 +38,17 @@
     likeBonus: 0.25, // stars added to a friend's rating when they also liked the film
     minFriends: 2,   // hide films watched by fewer friends than this
     watchlist: 'all',// 'all' | 'only' | 'hide'
-    minRuntime: 60,  // hide anything shorter than this many minutes (0 = keep shorts)
+    hideShorts: true,// hide anything shorter than CFG.shortMinutes
     kind: 'movie',   // 'movie' | 'tv' | 'all'  (series = TMDB TV entries, e.g. miniseries)
-    sort: 'score',   // 'score' (recommendation score) | 'watched' (most follows watched it, ratings ignored)
-    yearFrom: null,  // release year range (null = open)
-    yearTo: null,
-    genre: '',       // only this genre ('' = any)
-    exGenre: '',     // never this genre
+    sort: 'score',   // 'score' | 'watched' (most follows watched it) | 'friends' (friends' average rating)
+    decade: '',      // '' | '2020' | '2010' | … | 'earlier' (before 1930)
+    genres: [],      // must have all of these
+    exGenres: [],    // must have none of these
     country: '',     // any production country matches (e.g. "France")
-    language: '',    // any listed language matches, by name or code (e.g. "Japanese" or "ja")
+    language: '',    // any listed language matches (ISO code, e.g. "ja")
   };
+  const TUNING_KEYS = ['k', 'beta', 'taste', 'likeBonus'];
+  const FILTER_KEYS = ['decade', 'genres', 'exGenres', 'country', 'language'];
   const GENRES = ['Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family', 'Fantasy', 'History',
     'Horror', 'Music', 'Mystery', 'Romance', 'Science Fiction', 'Thriller', 'TV Movie', 'War', 'Western'];
   const COMMON_COUNTRIES = ['USA', 'UK', 'France', 'Japan', 'South Korea', 'Italy', 'Germany', 'Spain', 'Canada', 'India', 'China',
@@ -293,7 +296,7 @@
   const staleRating = (f) => hasDetails(f) && Date.now() - f.globalAt > CFG.globalTtlDays * DAY;
   const needsDetails = (f) => !hasDetails(f) || staleRating(f);
 
-  async function ensureGlobals(films, slugs) {
+  async function ensureGlobals(films, slugs, onOne) {
     const now = Date.now();
     const todo = slugs.map((s) => films.get(s) || { slug: s, name: s }).filter(needsDetails);
     await Promise.all(todo.map(async (f) => {
@@ -307,6 +310,7 @@
         f.globalAt = now;
         films.set(f.slug, f);
       } catch (err) { console.warn('[friend-recs] details failed', f.slug, err); }
+      onOne?.();
     }));
     await idb.putMany('films', todo);
     return todo.length;
@@ -381,8 +385,13 @@
       out.push({ ...a, inWl, film, hasGlobal: film?.avg != null, friendAvg: a.nRated ? a.rawSum / a.nRated : null,
         score: friendScore + w.beta * Math.log(1 + a.n) });
     }
-    const byWatched = (x, y) => y.n - x.n || (x.film?.name || x.slug).localeCompare(y.film?.name || y.slug);
-    return out.sort(w.sort === 'watched' ? byWatched : (x, y) => y.score - x.score);
+    const byName = (x, y) => (x.film?.name || x.slug).localeCompare(y.film?.name || y.slug);
+    const sorts = {
+      score: (x, y) => y.score - x.score,
+      watched: (x, y) => y.n - x.n || byName(x, y),
+      friends: (x, y) => (y.friendAvg ?? -1) - (x.friendAvg ?? -1) || y.nRated - x.nRated || byName(x, y),
+    };
+    return out.sort(sorts[w.sort] || sorts.score);
   }
 
   // ---------- Filters ----------
@@ -391,304 +400,550 @@
   const yearOf = (f) => f?.year ?? (+((f?.name || '').match(/\((\d{4})\)\s*$/)?.[1]) || null);
   // Genre/country/language are "strict": a film whose details we don't have yet can't be shown.
   // Length/type are lenient: those films are shown until their details arrive (most films pass anyway).
-  const strictActive = (w) => !!(w.genre || w.exGenre || w.country || w.language);
+  const strictActive = (w) => !!(w.genres.length || w.exGenres.length || w.country || w.language);
+  const filtersActive = (w) => !!(w.decade || strictActive(w));
   const norm = (s) => String(s || '').trim().toLowerCase();
 
   function passesYear(r, w) {
-    if (w.yearFrom == null && w.yearTo == null) return true;
+    if (!w.decade) return true;
     const y = yearOf(r.film);
     if (y == null) return !hasDetails(r.film); // unknown year: wait for details
-    return (w.yearFrom == null || y >= w.yearFrom) && (w.yearTo == null || y <= w.yearTo);
+    if (w.decade === 'earlier') return y < 1930;
+    return y >= +w.decade && y < +w.decade + 10;
   }
 
   function passesFilters(r, w) {
     if (!passesYear(r, w)) return false;
     const f = r.film;
     if (!hasDetails(f)) return !strictActive(w);
-    if (w.minRuntime && f.runtime != null && f.runtime < w.minRuntime) return false;
+    if (w.hideShorts && f.runtime != null && f.runtime < CFG.shortMinutes) return false;
     if (w.kind !== 'all' && f.kind && f.kind !== w.kind) return false;
     const genres = (f.genres || []).map(norm);
-    if (w.genre && !genres.includes(norm(w.genre))) return false;
-    if (w.exGenre && genres.includes(norm(w.exGenre))) return false;
+    if (!w.genres.every((g) => genres.includes(norm(g)))) return false;
+    if (w.exGenres.some((g) => genres.includes(norm(g)))) return false;
     if (w.country && !(f.countries || []).some((c) => norm(c) === norm(w.country))) return false;
-    if (w.language && !(f.languages || []).some((l) => norm(l) === norm(w.language) || norm(langName(l)) === norm(w.language))) return false;
+    if (w.language && !(f.languages || []).some((l) => norm(l) === norm(w.language))) return false;
     return true;
   }
 
   // ---------- UI ----------
+  // The page lives at /<you>/watchlist/#friend-recs: the watchlist page has the profile tabs, a main
+  // column and a sidebar, so we hide its content and show ours in the same layout, built from
+  // Letterboxd's own classes (section-heading, sorting-selects/smenu, poster-grid, pagination,
+  // actions-panel) so it picks up the site's styles.
+  const ROUTE_HASH = '#friend-recs';
+  const routeHref = (me) => `/${me}/watchlist/${ROUTE_HASH}`;
+  const isRoute = (me) => location.pathname.toLowerCase() === `/${me}/watchlist/` && location.hash === ROUTE_HASH;
+
+  const SORT_LABELS = { score: 'Recommended', watched: 'Most watched by friends', friends: 'Friends’ rating' };
+  const DECADES = ['2020', '2010', '2000', '1990', '1980', '1970', '1960', '1950', '1940', '1930'];
+
   const STYLE = `
-    .lfr-btn{position:fixed;left:20px;bottom:20px;z-index:9999;padding:10px 16px;border:0;border-radius:999px;background:#00b020;color:#fff;
-      font:600 13px/1 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.4);cursor:pointer}
-    .lfr{position:fixed;inset:0;z-index:10000;background:#14181c;color:#def;font:14px/1.4 system-ui,sans-serif;display:flex;flex-direction:column}
-    .lfr header{padding:14px 20px;border-bottom:1px solid #2c3440;display:flex;flex-wrap:wrap;gap:10px 20px;align-items:center}
-    .lfr h2{margin:0 auto 0 0;font-size:18px;color:#fff}
-    .lfr button{padding:8px 14px;border-radius:6px;border:1px solid #456;background:#2c3440;color:#fff;cursor:pointer;font:600 13px system-ui,sans-serif}
-    .lfr button.primary{background:#00b020;border-color:#00b020}
-    .lfr button:disabled{opacity:.5;cursor:progress}
-    .lfr .ctrls{padding:10px 20px;border-bottom:1px solid #2c3440;display:flex;flex-wrap:wrap;gap:10px 22px;align-items:flex-end}
-    .lfr label{display:flex;flex-direction:column;gap:2px;font-size:11px;color:#89a;text-transform:uppercase;letter-spacing:.04em}
-    .lfr label b{color:#fff;font-weight:600;text-transform:none;letter-spacing:0}
-    .lfr label.off{opacity:.35;pointer-events:none}
-    .lfr input[type=range]{width:140px;accent-color:#00b020}
-    .lfr select,.lfr input[type=text],.lfr input[type=number]{background:#2c3440;color:#fff;border:1px solid #456;border-radius:6px;padding:5px 8px;font:13px system-ui,sans-serif}
-    .lfr input[type=text]{width:130px}
-    .lfr input[type=number]{width:80px}
-    .lfr .status{padding:8px 20px;color:#89a;font-size:12px;min-height:16px}
-    .lfr .grid{flex:1;overflow:auto;padding:12px 20px 24px;display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;align-content:start}
-    .lfr .card{display:flex;gap:12px;background:#1c2228;border-radius:8px;padding:10px;min-width:0}
-    .lfr .card img{width:70px;height:105px;object-fit:cover;border-radius:4px;background:#2c3440;flex:none}
-    .lfr .card .ph{width:70px;height:105px;border-radius:4px;background:#2c3440;flex:none}
-    .lfr .card .body{min-width:0;display:flex;flex-direction:column;gap:4px}
-    .lfr .card a.t{color:#fff;font-weight:700;text-decoration:none;font-size:15px}
-    .lfr .card a.t:hover{text-decoration:underline}
-    .lfr .card .meta{color:#89a;font-size:12px}
-    .lfr .card .stats{font-size:12px;color:#cde}
-    .lfr .card .score{color:#00e054;font-weight:700}
-    .lfr .card .wl{color:#40bcf4;font-size:11px;font-weight:600}
-    .lfr .card details{font-size:12px;color:#9ab}
-    .lfr .card details summary{cursor:pointer}
-    .lfr .more{grid-column:1/-1;justify-self:center}
-    .lfr .empty{grid-column:1/-1;padding:40px;text-align:center;color:#89a}
+    .lfr-hidden{display:none!important}
+    .lfr-page .poster-grid .griditem{position:relative}
+    .lfr-page .lfr-ph{display:block;width:100%;aspect-ratio:2/3;background:#2c3440;border-radius:4px}
+    .lfr-page .lfr-vd{display:flex;gap:6px;align-items:center;margin:4px 0 0;font-size:11px;line-height:16px;color:#678;white-space:nowrap;overflow:hidden}
+    .lfr-page .lfr-vd .lfr-stars{color:#89a;font-size:12px;letter-spacing:-.05em}
+    .lfr-page .lfr-vd .lfr-wl{width:6px;height:6px;border-radius:50%;background:#40bcf4;flex:none}
+    .lfr-page .lfr-note{margin:18px 0;color:#9ab;font-size:13px;line-height:1.6}
+    .lfr-page .lfr-note:empty{display:none}
+    .lfr-page .lfr-link{background:none;border:0;padding:0;font:inherit;color:#40bcf4;cursor:pointer}
+    .lfr-page .lfr-link:hover{color:#fff}
+    .lfr-page .lfr-empty{padding:48px 0;text-align:center;color:#9ab;font-size:15px;line-height:1.6}
+    .lfr-page .lfr-empty .button{margin-top:16px}
+    .lfr-page .lfr-tune label{display:flex;justify-content:space-between;margin:12px 0 2px;font-size:12px;color:#9ab}
+    .lfr-page .lfr-tune label b{color:#def;font-weight:400}
+    .lfr-page .lfr-tune input[type=range]{width:100%;accent-color:#00e054}
+    .lfr-page .lfr-tune p{margin:2px 0 0;font-size:11px;color:#678;line-height:1.4}
+    .lfr-menu .lfr-menu-heading{display:block;padding:8px 12px 2px;font-size:10px;letter-spacing:.075em;text-transform:uppercase;opacity:.65}
+    .lfr-menu li.lfr-on > a.item, .lfr-menu li.lfr-ex > a.item{font-weight:600}
+    .lfr-menu li.lfr-on > a.item::after{content:' ✓'}
+    .lfr-menu li.lfr-ex > a.item{text-decoration:line-through}
+    .lfr-menu li.lfr-ex > a.item::after{content:' ✕';display:inline-block;text-decoration:none}
+    .lfr-menu .lfr-menu-hint{display:block;padding:6px 12px 8px;font-size:11px;opacity:.7}
   `;
 
   function el(tag, attrs = {}, children = []) {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs)) {
-      if (v == null) continue;
+      if (v == null || v === false) continue;
       if (k === 'text') n.textContent = v;
       else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
       else n.setAttribute(k, v);
     }
-    for (const c of [].concat(children)) if (c != null) n.append(c);
+    for (const c of [].concat(children)) if (c != null && c !== false) n.append(c);
     return n;
   }
 
-  const readWeights = () => { try { return { ...DEFAULT_WEIGHTS, ...JSON.parse(localStorage.getItem(CFG.prefsKey) || '{}') }; } catch { return { ...DEFAULT_WEIGHTS }; } };
-  const saveWeights = (w) => { try { localStorage.setItem(CFG.prefsKey, JSON.stringify(w)); } catch { /* ignore */ } };
-  const ago = (t) => { if (!t) return 'never'; const m = Math.round((Date.now() - t) / 60000); return m < 60 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`; };
-  const starStr = (s) => (s == null ? '–' : s.toFixed(1));
+  const readPrefs = () => {
+    try { return { ...DEFAULT_WEIGHTS, ...JSON.parse(localStorage.getItem(CFG.prefsKey) || '{}') }; }
+    catch { return { ...DEFAULT_WEIGHTS }; }
+  };
+  const savePrefs = (w) => { try { localStorage.setItem(CFG.prefsKey, JSON.stringify(w)); } catch { /* ignore */ } };
+  const ago = (t) => {
+    if (!t) return 'never';
+    const m = Math.round((Date.now() - t) / 60000);
+    return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} hours ago` : `${Math.round(m / 1440)} days ago`;
+  };
+  // 4.3 → "★★★★½" (rounded to the nearest half star, like Letterboxd ratings)
+  const stars = (s) => { const h = Math.round(s * 2); return '★'.repeat(Math.floor(h / 2)) + (h % 2 ? '½' : ''); };
+  const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
 
-  async function openApp(me) {
-    document.querySelector('.lfr')?.remove();
-    const w = readWeights();
-    let prep = null, films = new Map(), watchlist = new Set(), ranked = [], shown = CFG.pageSize, renderToken = 0;
-
-    const statusEl = el('div', { class: 'status' });
-    const grid = el('div', { class: 'grid' });
-    const lastSyncEl = el('span', { class: 'meta' });
-    const syncBtn = el('button', { class: 'primary', text: 'Sync now' });
-    const setStatus = (s) => (statusEl.textContent = s);
-
-    const slider = (key, label, min, max, step, fmt = (v) => v) => {
-      const val = el('b', { text: fmt(w[key]) });
-      const input = el('input', { type: 'range', min, max, step, value: w[key] });
-      input.addEventListener('input', () => { w[key] = +input.value; val.textContent = fmt(w[key]); saveWeights(w); scheduleRank(); });
-      return el('label', {}, [label, val, input]);
-    };
-    const wlSel = el('select', {}, [['all', 'All films'], ['only', 'Only my watchlist'], ['hide', 'Hide my watchlist']]
-      .map(([v, t]) => el('option', { value: v, text: t })));
-    wlSel.value = w.watchlist;
-    wlSel.addEventListener('change', () => { w.watchlist = wlSel.value; saveWeights(w); scheduleRank(); });
-    const kindSel = el('select', {}, [['movie', 'Films only'], ['tv', 'Series only'], ['all', 'Films + series']]
-      .map(([v, t]) => el('option', { value: v, text: t })));
-    kindSel.value = w.kind;
-    kindSel.addEventListener('change', () => { w.kind = kindSel.value; saveWeights(w); scheduleRank(); });
-    // Score sliders do nothing in "most watched" mode, so they are dimmed there.
-    const scoreCtrls = [
-      slider('k', 'Pull to global avg', 0, 10, 0.5),
-      slider('beta', 'Bonus: # friends watched', 0, 0.6, 0.05),
-      slider('taste', 'Taste matching', 0, 2, 0.1),
-      slider('likeBonus', 'Like bonus (★)', 0, 1, 0.05),
-    ];
-    const syncScoreCtrls = () => scoreCtrls.forEach((c) => c.classList.toggle('off', w.sort === 'watched'));
-    const sortSel = el('select', {}, [['score', 'Recommended (score)'], ['watched', 'Most watched by follows']]
-      .map(([v, t]) => el('option', { value: v, text: t })));
-    sortSel.value = w.sort;
-    sortSel.addEventListener('change', () => { w.sort = sortSel.value; saveWeights(w); syncScoreCtrls(); scheduleRank(); });
-    syncScoreCtrls();
-
-    // Letterboxd-style filters (second row).
-    const setFilter = (key, value) => { w[key] = value; saveWeights(w); scheduleRank(); };
-    const yearInput = (key, label) => {
-      const input = el('input', { type: 'number', min: 1870, max: 2100, placeholder: 'any', value: w[key] ?? '' });
-      input.addEventListener('change', () => setFilter(key, input.value === '' ? null : +input.value));
-      return el('label', {}, [label, input]);
-    };
-    const genreSelect = (key, label, anyText) => {
-      const s = el('select', {}, [el('option', { value: '', text: anyText }), ...GENRES.map((g) => el('option', { value: g, text: g }))]);
-      s.value = w[key] || '';
-      s.addEventListener('change', () => setFilter(key, s.value));
-      return el('label', {}, [label, s]);
-    };
-    const countryList = el('datalist', { id: 'lfr-countries' });
-    const langList = el('datalist', { id: 'lfr-langs' });
-    const textFilter = (key, label, listId, placeholder) => {
-      const input = el('input', { type: 'text', list: listId, placeholder, value: w[key] || '' });
-      input.addEventListener('change', () => setFilter(key, input.value.trim()));
-      return el('label', {}, [label, input]);
-    };
-    function refreshDatalists() {
-      const cs = new Set(COMMON_COUNTRIES), ls = new Set(COMMON_LANGS);
-      for (const f of films.values()) { (f.countries || []).forEach((c) => cs.add(c)); (f.languages || []).forEach((l) => ls.add(l)); }
-      countryList.replaceChildren(...[...cs].sort().map((c) => el('option', { value: c })));
-      langList.replaceChildren(...[...new Set([...ls].map(langName))].sort().map((n) => el('option', { value: n })));
-    }
-    const clearFilters = () => {
-      Object.assign(w, { yearFrom: null, yearTo: null, genre: '', exGenre: '', country: '', language: '' });
-      saveWeights(w);
-      openApp(me); // rebuild the controls with empty values
-    };
-
-    const app = el('div', { class: 'lfr' }, [
-      el('header', {}, [
-        el('h2', { text: 'Recommended by people you follow' }),
-        lastSyncEl, syncBtn,
-        el('button', { text: 'Close', onclick: () => app.remove() }),
-      ]),
-      el('div', { class: 'ctrls' }, [
-        el('label', {}, ['Sort', sortSel]),
-        ...scoreCtrls,
-        slider('minFriends', 'Min. friends', 1, 10, 1),
-        slider('minRuntime', 'Min. length', 0, 120, 5, (v) => (v ? `${v} min` : 'any')),
-        el('label', {}, ['Type', kindSel]),
-        el('label', {}, ['Watchlist', wlSel]),
-      ]),
-      el('div', { class: 'ctrls' }, [
-        yearInput('yearFrom', 'Year from'),
-        yearInput('yearTo', 'Year to'),
-        genreSelect('genre', 'Genre', 'Any genre'),
-        genreSelect('exGenre', 'Exclude genre', 'None'),
-        textFilter('country', 'Country', 'lfr-countries', 'any'),
-        textFilter('language', 'Language', 'lfr-langs', 'any'),
-        el('button', { text: 'Clear filters', onclick: clearFilters }),
-        countryList, langList,
-      ]),
-      statusEl, grid,
+  // A Letterboxd-style dropdown: "LABEL ▾" in the sorting bar, opening a ul.smenu-menu (styled by
+  // the site) on hover or click. build() returns groups of items; onPick() returns true to keep it open.
+  let closeOpenMenu = null;
+  function makeMenu({ id, prefix, label, build, onPick }) {
+    const labelText = document.createTextNode(label());
+    const labelEl = el('label', {}, [labelText, el('i', { class: 'ir s icon' })]);
+    const wrapper = el('section', { class: 'smenu-wrapper', 'data-lfr-menu': id }, [
+      prefix ? el('strong', { class: 'smenu-label', text: prefix }) : null,
+      el('div', { class: 'smenu' }, [labelEl]),
     ]);
-    document.body.append(app);
+    let menu = null, closeTimer = null;
+    const close = () => { clearTimeout(closeTimer); menu?.remove(); menu = null; if (closeOpenMenu === close) closeOpenMenu = null; };
+    const closeSoon = () => { clearTimeout(closeTimer); closeTimer = setTimeout(close, 250); };
+    const fill = () => {
+      menu.replaceChildren(
+        el('li', { class: 'smenu-selected' }, [label(), el('i', { class: 'ir s icon' })]),
+        ...build().map((g) => el('li', { class: 'divider-line' }, [
+          g.heading ? el('span', { class: 'lfr-menu-heading', text: g.heading }) : null,
+          el('ul', {}, g.items.map((it) => el('li', { class: it.state ? `lfr-${it.state}` : null }, [
+            el('a', {
+              href: '#', class: 'item', 'data-value': it.value,
+              onclick: (e) => {
+                e.preventDefault();
+                const keep = onPick(it.value);
+                labelText.textContent = label();
+                if (keep && menu) fill(); else close();
+              },
+            }, [el('i', { class: 'ir s icon' }), it.text]),
+          ]))),
+          g.hint ? el('span', { class: 'lfr-menu-hint', text: g.hint }) : null,
+        ])),
+      );
+    };
+    const open = () => {
+      clearTimeout(closeTimer);
+      if (menu) return;
+      closeOpenMenu?.(); // only one dropdown open at a time
+      closeOpenMenu = close;
+      menu = el('ul', { class: 'smenu-menu lfr-menu', 'data-lfr-menu': id });
+      fill();
+      const r = labelEl.getBoundingClientRect();
+      Object.assign(menu.style, { display: 'block', position: 'absolute', zIndex: 1000,
+        top: `${r.top + window.scrollY - 10}px`, left: `${r.left + window.scrollX - 8}px` });
+      menu.addEventListener('mouseenter', () => clearTimeout(closeTimer));
+      menu.addEventListener('mouseleave', closeSoon);
+      document.body.append(menu);
+    };
+    wrapper.addEventListener('mouseenter', open);
+    wrapper.addEventListener('mouseleave', (e) => { if (!menu?.contains(e.relatedTarget)) closeSoon(); });
+    labelEl.addEventListener('click', (e) => { e.preventDefault(); if (menu) close(); else open(); });
+    return { wrapper, close, refreshLabel: () => { labelText.textContent = label(); } };
+  }
+
+  // ---------- The page ----------
+  function createPage(me) {
+    const w = readPrefs();
+    const P = CFG.pageSize;
+    let prep = null, films = new Map(), watchlist = new Set(), ranked = [], page = 1, token = 0;
+    // Films on pages you've already paged past keep their place, so moving between pages never repeats
+    // or skips films while details (and global ratings) arriving for later pages re-rank the rest.
+    let placed = [];
+    const resetPaging = () => { page = 1; placed = []; };
+    let scanPaused = false, busyNote = '', lastSync = null, friendCount = 0;
+    const emptyPoster = document.querySelector('[data-empty-poster-src]')?.dataset.emptyPosterSrc || null;
+
+    // --- main column
+    const heading = el('h1', { class: 'section-heading' });
+    const grid = el('ul', { class: 'grid -p125 -constrained' });
+    const note = el('div', { class: 'lfr-note' });
+    const pager = el('div', { class: 'pagination' });
+    const setFilter = (key, value) => { w[key] = value; savePrefs(w); resetPaging(); refresh(); return false; };
+    const toggleIn = (key, value) => { const s = new Set(w[key]); if (s.has(value)) s.delete(value); else s.add(value); return [...s]; };
+
+    const knownValues = (pick) => {
+      const counts = new Map();
+      for (const r of ranked) for (const v of (hasDetails(r.film) ? pick(r.film) : [])) counts.set(v, (counts.get(v) || 0) + 1);
+      return counts;
+    };
+    const topValues = (counts, common, n = 30) => [...new Set([...[...counts].sort((a, b) => b[1] - a[1]).map(([v]) => v), ...common])].slice(0, n);
+
+    const menus = [
+      makeMenu({
+        id: 'sort', prefix: 'Sort by', label: () => SORT_LABELS[w.sort] || SORT_LABELS.score,
+        build: () => [{ items: Object.entries(SORT_LABELS).map(([v, t]) => ({ value: v, text: t, state: w.sort === v && 'on' })) }],
+        onPick: (v) => setFilter('sort', v),
+      }),
+      makeMenu({
+        id: 'other', label: () => 'Other',
+        build: () => [
+          { heading: 'Show', items: [['movie', 'Films'], ['tv', 'Series'], ['all', 'Films and series']].map(([v, t]) => ({ value: `kind:${v}`, text: t, state: w.kind === v && 'on' })) },
+          { items: [{ value: 'shorts', text: `Hide shorts (under ${CFG.shortMinutes} min)`, state: w.hideShorts && 'on' }] },
+          { heading: 'Watchlist', items: [['all', 'Include my watchlist'], ['hide', 'Hide my watchlist'], ['only', 'Only my watchlist']].map(([v, t]) => ({ value: `wl:${v}`, text: t, state: w.watchlist === v && 'on' })) },
+          { heading: 'Watched by at least', items: [1, 2, 3, 5].map((n) => ({ value: `min:${n}`, text: plural(n, 'friend'), state: w.minFriends === n && 'on' })) },
+        ],
+        onPick: (v) => {
+          const [k, x] = v.split(':');
+          if (k === 'kind') setFilter('kind', x);
+          else if (k === 'wl') setFilter('watchlist', x);
+          else if (k === 'min') setFilter('minFriends', +x);
+          else if (v === 'shorts') setFilter('hideShorts', !w.hideShorts);
+          return true;
+        },
+      }),
+      makeMenu({
+        id: 'language', label: () => (w.language ? langName(w.language) : 'Language'),
+        build: () => [{
+          items: [{ value: '', text: 'Any language', state: !w.language && 'on' },
+            ...topValues(knownValues((f) => f.languages || []), COMMON_LANGS)
+              .map((c) => ({ value: c, text: langName(c), state: w.language === c && 'on' }))
+              .sort((a, b) => a.text.localeCompare(b.text))],
+        }],
+        onPick: (v) => setFilter('language', v),
+      }),
+      makeMenu({
+        id: 'country', label: () => w.country || 'Country',
+        build: () => [{
+          items: [{ value: '', text: 'Any country', state: !w.country && 'on' },
+            ...topValues(knownValues((f) => f.countries || []), COMMON_COUNTRIES).sort()
+              .map((c) => ({ value: c, text: c, state: w.country === c && 'on' }))],
+        }],
+        onPick: (v) => setFilter('country', v),
+      }),
+      makeMenu({
+        id: 'genre',
+        label: () => {
+          const n = w.genres.length + w.exGenres.length;
+          return n === 0 ? 'Genre' : n === 1 ? (w.genres[0] || `Not ${w.exGenres[0]}`) : `Genre (${n})`;
+        },
+        build: () => [{
+          items: [{ value: '', text: 'Any genre', state: !w.genres.length && !w.exGenres.length && 'on' },
+            ...GENRES.map((g) => ({ value: g, text: g, state: w.genres.includes(g) ? 'on' : w.exGenres.includes(g) ? 'ex' : null }))],
+          hint: 'Click once to include, twice to exclude.',
+        }],
+        onPick: (g) => {
+          if (!g) { w.genres = []; w.exGenres = []; }
+          else if (w.genres.includes(g)) { w.genres = toggleIn('genres', g); w.exGenres = toggleIn('exGenres', g); }
+          else if (w.exGenres.includes(g)) w.exGenres = toggleIn('exGenres', g);
+          else w.genres = toggleIn('genres', g);
+          setFilter('genres', w.genres);
+          return true;
+        },
+      }),
+      makeMenu({
+        id: 'decade', label: () => (w.decade === 'earlier' ? 'Before 1930' : w.decade ? `${w.decade}s` : 'Decade'),
+        build: () => [{
+          items: [{ value: '', text: 'Any decade', state: !w.decade && 'on' },
+            ...DECADES.map((d) => ({ value: d, text: `${d}s`, state: w.decade === d && 'on' })),
+            { value: 'earlier', text: 'Before 1930', state: w.decade === 'earlier' && 'on' }],
+        }],
+        onPick: (v) => setFilter('decade', v),
+      }),
+    ];
+    // Letterboxd floats these right, so DOM order is the reverse of the on-screen order.
+    const sortBar = el('div', { id: 'content-nav', class: 'basic' }, [el('div', { class: 'sorting-selects' }, menus.map((m) => m.wrapper))]);
+    const main = el('section', { class: 'section col-17 col-main' }, [heading, sortBar, el('div', { class: 'poster-grid' }, [grid]), note, pager]);
+
+    // --- sidebar
+    const syncLink = el('a', { href: '#', text: 'Sync friends’ films' });
+    const clearItem = el('li', {}, [el('a', { href: '#', text: 'Clear filters', onclick: (e) => { e.preventDefault(); clearFilters(); } })]);
+    const tuneLink = el('a', { href: '#', text: 'Tune recommendations' });
+    const about = el('div', { class: 'body-text -small -reset' });
+    const slider = (key, label, min, max, step, help) => {
+      const val = el('b', { text: String(w[key]) });
+      const input = el('input', { type: 'range', min, max, step, value: w[key] });
+      input.addEventListener('input', () => { w[key] = +input.value; val.textContent = String(w[key]); savePrefs(w); scheduleRefresh(); });
+      return [el('label', {}, [label, val]), input, el('p', { text: help })];
+    };
+    const tune = el('section', { class: 'section panel-text lfr-tune lfr-hidden' }, [
+      el('h3', { class: 'section-heading', text: 'Tune recommendations' }),
+      ...slider('taste', 'Taste matching', 0, 2, 0.1, 'Friends whose ratings agree with yours count more.'),
+      ...slider('k', 'Letterboxd average', 0, 10, 0.5, 'How much the global rating weighs against your friends’.'),
+      ...slider('beta', 'Popular with friends', 0, 0.6, 0.05, 'Bonus for films many friends watched.'),
+      ...slider('likeBonus', 'Likes', 0, 1, 0.05, 'Extra weight when a friend also liked the film.'),
+      el('p', {}, [el('button', { class: 'lfr-link', text: 'Reset to defaults', onclick: () => {
+        TUNING_KEYS.forEach((k) => { w[k] = DEFAULT_WEIGHTS[k]; });
+        savePrefs(w);
+        rebuild();
+      } })]),
+    ]);
+    tuneLink.addEventListener('click', (e) => { e.preventDefault(); tune.classList.toggle('lfr-hidden'); });
+    const sidebar = el('aside', { class: 'sidebar' }, [
+      el('section', { class: 'actions-panel', 'data-theme': 'panel' }, [el('ul', {}, [el('li', {}, [syncLink]), clearItem, el('li', {}, [tuneLink])])]),
+      tune,
+      el('section', { class: 'section panel-text' }, [el('h3', { class: 'section-heading', text: 'How it works' }), about]),
+    ]);
+
+    const root = el('div', { class: 'cols-2 lfr-page' }, [main, sidebar]);
+
+    // --- data
+    const visible = () => {
+      const list = ranked.filter((r) => passesFilters(r, w));
+      if (!placed.length) return list;
+      const bySlug = new Map(list.map((r) => [r.slug, r]));
+      const frozen = new Set(placed);
+      return placed.map((s) => bySlug.get(s)).filter(Boolean).concat(list.filter((r) => !frozen.has(r.slug)));
+    };
+    const unchecked = () => ranked.filter((r) => passesYear(r, w) && !hasDetails(r.film));
+    // data-busy is set while fetching/syncing (also used by the tests to know when the page is idle).
+    let refreshing = false, syncing = false;
+    const updateBusy = () => { if (refreshing || syncing) root.dataset.busy = '1'; else delete root.dataset.busy; };
+    const syncStatus = el('p', { class: 'lfr-sync-status' });
 
     async function load() {
       const [users, filmList, wl, last] = await Promise.all([idb.all('users'), idb.all('films'), idb.get('meta', 'watchlist'), idb.get('meta', 'lastSync')]);
       films = new Map(filmList.map((f) => [f.slug, f]));
       watchlist = new Set(wl?.slugs || []);
-      lastSyncEl.textContent = `Last sync: ${ago(last?.at)}`;
+      lastSync = last?.at || null;
       prep = users.some((u) => u.username !== me) ? prepare(users, me) : null;
-      return { users, last };
+      friendCount = prep?.friends.length || 0;
     }
 
-    let rankTimer = null;
-    const scheduleRank = () => { clearTimeout(rankTimer); rankTimer = setTimeout(() => { shown = CFG.pageSize; rerank(); }, 150); };
+    let refreshTimer = null;
+    const scheduleRefresh = () => { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { resetPaging(); refresh(); }, 200); };
 
-    const visible = () => ranked.filter((r) => passesFilters(r, w));
-    const unchecked = () => ranked.filter((r) => passesYear(r, w) && !hasDetails(r.film));
-    let scanPaused = false;
-
-    async function rerank() {
-      if (!prep) return;
-      const token = ++renderToken;
-      let scanned = 0;
+    // Rank, then fetch details for the films on the current page (and, with genre/country/language
+    // filters, check the next candidates until the page is full), re-ranking as details arrive.
+    async function refresh() {
+      if (!prep) { render(); return; }
+      const t = ++token;
+      let scanned = 0, checked = 0;
       scanPaused = false;
+      refreshing = true;
+      updateBusy();
       ranked = rank(prep, films, watchlist, w);
       render();
-      // Fetch details for the shown films, then re-rank and re-filter (the global rating can move films;
-      // shorts/series drop out). With genre/country/language filters and a page that isn't full yet,
-      // check the next unchecked candidates in rank order, up to scanPerRun films.
-      for (let round = 0; round < 40 && token === renderToken; round++) {
-        const list = visible();
-        let need = list.slice(0, shown).filter((r) => needsDetails(r.film)).map((r) => r.slug);
-        let label = `Fetching details for ${need.length} films…`;
-        if (!need.length && strictActive(w) && list.length < shown) {
-          const rest = unchecked();
-          if (!rest.length) break;
-          if (scanned >= CFG.scanPerRun) { scanPaused = true; render(); break; }
-          need = rest.slice(0, CFG.scanBatch).map((r) => r.slug);
-          scanned += need.length;
-          label = `Checking films against your filters… ${scanned} checked, ${list.length} match so far`;
+      try {
+        for (let round = 0; round < 80 && t === token; round++) {
+          const list = visible();
+          const end = page * P;
+          let need = list.slice(end - P, end).filter((r) => needsDetails(r.film)).map((r) => r.slug);
+          let scanning = false;
+          if (!need.length && strictActive(w) && list.length < end) {
+            const rest = unchecked();
+            if (!rest.length) break;
+            if (scanned >= CFG.scanPerRun) { scanPaused = true; break; }
+            need = rest.slice(0, CFG.scanBatch).map((r) => r.slug);
+            scanned += need.length;
+            scanning = true;
+          }
+          if (!need.length) break;
+          // Show progress for every film checked: requests are deliberately slow (~3 per second).
+          const showProgress = () => {
+            busyNote = scanning
+              ? `Checking your friends’ films against these filters… ${checked.toLocaleString()} checked, ${visible().length.toLocaleString()} match so far`
+              : 'Loading posters and details…';
+            note.textContent = busyNote;
+          };
+          render();
+          showProgress();
+          await ensureGlobals(films, need, () => { if (t !== token) return; if (scanning) checked++; showProgress(); });
+          if (t !== token) return;
+          ranked = rank(prep, films, watchlist, w);
+          render();
         }
-        if (!need.length) break;
-        setStatus(label);
-        await ensureGlobals(films, need);
-        if (token !== renderToken) return;
-        ranked = rank(prep, films, watchlist, w);
-        render();
+      } finally {
+        if (t === token) { busyNote = ''; refreshing = false; updateBusy(); render(); }
       }
-      if (token !== renderToken) return;
-      refreshDatalists();
-      const left = strictActive(w) ? unchecked().length : 0;
-      setStatus(`${visible().length.toLocaleString()} shown of ${ranked.length.toLocaleString()} candidates watched by your follows and not by you · ${prep.friends.length} follows`
-        + (left ? ` · ${left.toLocaleString()} candidates not checked against genre/country/language yet` : ''));
     }
 
     function card(r) {
-      const f = r.film || { name: r.slug };
-      const raters = [...r.raters].sort((a, b) => b.stars - a.stars);
-      return el('div', { class: 'card' }, [
-        f.image ? el('img', { src: f.image, alt: '', loading: 'lazy' }) : el('div', { class: 'ph' }),
-        el('div', { class: 'body' }, [
-          el('a', { class: 't', href: `/film/${r.slug}/`, target: '_blank', text: f.name }),
-          el('div', { class: 'meta', text: [f.kind === 'tv' && 'Series', yearOf(f), f.runtime && `${f.runtime} min`, f.directors?.length && f.directors.slice(0, 2).join(', ')].filter(Boolean).join(' · ') }),
-          f.genres?.length || f.countries?.length
-            ? el('div', { class: 'meta', text: [f.genres?.slice(0, 3).join(', '), f.countries?.slice(0, 2).join(', ')].filter(Boolean).join(' · ') })
-            : null,
-          el('div', { class: 'stats' }, [
-            ...(w.sort === 'watched'
-              ? [el('span', { class: 'score', text: `👥 ${r.n} watched` }), ` · Score ${r.score.toFixed(2)}`]
-              : [el('span', { class: 'score', text: `Score ${r.score.toFixed(2)}` }), ` · 👥 ${r.n} watched`]),
-            ` · ★ ${starStr(r.friendAvg)} friends (${r.nRated}) · 🌍 ${starStr(r.film?.avg)}`,
-            r.nLiked ? ` · ♥ ${r.nLiked}` : '',
-          ]),
-          r.inWl ? el('div', { class: 'wl', text: 'On your watchlist' }) : null,
-          el('details', {}, [
-            el('summary', { text: 'Who watched it' }),
-            el('div', { text: raters.map((x) => `${x.user} ${x.stars ? `★${x.stars}` : '✓'}${x.liked ? ' ♥' : ''}`).join(' · ') }),
-          ]),
+      const f = r.film || {};
+      const y = yearOf(f);
+      const name = f.name || r.slug;
+      const title = y && !/\(\d{4}\)\s*$/.test(name) ? `${name} (${y})` : name;
+      const raters = [...r.raters].sort((a, b) => b.stars - a.stars)
+        .map((x) => `${x.user} ${x.stars ? stars(x.stars) : '(watched)'}${x.liked ? ' ♥' : ''}`);
+      const tip = [
+        title,
+        `Watched by ${plural(r.n, 'friend')}${r.friendAvg != null ? ` · friends’ average ${r.friendAvg.toFixed(1)}` : ''}${f.avg != null ? ` · Letterboxd ${f.avg.toFixed(1)}` : ''}`,
+        r.inWl ? 'In your watchlist' : null,
+        '',
+        ...raters.slice(0, 12),
+        raters.length > 12 ? `+${raters.length - 12} more` : null,
+      ].filter((x) => x != null).join('\n');
+      const img = f.image || emptyPoster;
+      return el('li', { class: 'griditem', 'data-slug': r.slug }, [
+        el('div', { class: 'poster film-poster' }, [
+          img ? el('img', { class: 'image', src: img, width: 125, height: 187, alt: `Poster for ${title}`, loading: 'lazy' }) : el('span', { class: 'lfr-ph' }),
+          el('a', { class: 'frame', href: `/film/${r.slug}/`, title: tip }, [el('span', { class: 'frame-title', text: title }), el('span', { class: 'overlay' })]),
+        ]),
+        el('p', { class: 'poster-viewingdata lfr-vd', title: tip }, [
+          r.friendAvg != null ? el('span', { class: 'lfr-stars', text: stars(r.friendAvg) }) : null,
+          el('span', { text: plural(r.n, 'friend') }),
+          r.inWl ? el('span', { class: 'lfr-wl', title: 'In your watchlist' }) : null,
         ]),
       ]);
     }
 
-    function render() {
-      if (!prep) {
-        grid.replaceChildren(el('div', { class: 'empty', text: 'No data yet. Click "Sync now" — the first sync reads every film your follows have watched, which can take several minutes. Later syncs only fetch what changed.' }));
-        return;
-      }
-      const list = visible();
-      const cards = list.slice(0, shown).map(card);
-      const left = strictActive(w) ? unchecked().length : 0;
-      if (!cards.length) cards.push(el('div', { class: 'empty', text: left ? 'No matches among the films checked so far…' : 'Nothing matches these filters.' }));
-      if (list.length > shown) cards.push(el('button', { class: 'more', text: 'Show more', onclick: () => { shown += CFG.pageSize; rerank(); } }));
-      else if (scanPaused && left) {
-        cards.push(el('button', { class: 'more', text: `Check ${Math.min(CFG.scanPerRun, left)} more films (${left.toLocaleString()} not checked yet)`, onclick: () => rerank() }));
-      }
-      grid.replaceChildren(...cards);
+    function renderPager(total, more) {
+      const pages = Math.max(1, Math.ceil(total / P));
+      if (pages <= 1) { pager.replaceChildren(); return; }
+      const go = (p) => (e) => {
+        e.preventDefault();
+        if (p > page) placed = visible().slice(0, page * P).map((r) => r.slug); // lock what you've seen
+        page = p;
+        refresh();
+        main.scrollIntoView({ behavior: 'smooth' });
+      };
+      const link = (p, text, cls) => el('a', { href: '#', class: cls, text, onclick: go(p) });
+      const nums = [...new Set([1, page - 2, page - 1, page, page + 1, page + 2, pages])].filter((p) => p >= 1 && p <= pages).sort((a, b) => a - b);
+      const items = [];
+      nums.forEach((p, i) => {
+        if (i && p - nums[i - 1] > 1) items.push(el('li', { class: 'paginate-page unseen-pages', text: '…' }));
+        items.push(el('li', { class: `paginate-page${p === page ? ' paginate-current' : ''}` }, [p === page ? el('span', { text: String(p) }) : link(p, String(p))]));
+      });
+      pager.replaceChildren(
+        el('div', { class: `paginate-nextprev${page <= 1 ? ' paginate-disabled' : ''}` }, [page <= 1 ? el('span', { class: 'previous', text: 'Previous' }) : link(page - 1, 'Previous', 'previous')]),
+        el('div', { class: `paginate-nextprev${page >= pages && !more ? ' paginate-disabled' : ''}` }, [page >= pages ? el('span', { class: 'next', text: 'Next' }) : link(page + 1, 'Next', 'next')]),
+        el('div', { class: 'paginate-pages' }, [el('ul', {}, items)]),
+      );
     }
 
-    syncBtn.addEventListener('click', async () => {
-      syncBtn.disabled = true;
+    function render() {
+      menus.forEach((m) => m.refreshLabel());
+      clearItem.classList.toggle('lfr-hidden', !filtersActive(w));
+      about.replaceChildren(
+        el('p', { text: `Films watched by the ${friendCount.toLocaleString()} ${friendCount === 1 ? 'person' : 'people'} you follow that you haven’t seen yet, ranked by their ratings (adjusted for how generous each person is and how close their taste is to yours), how many of them watched it, and the Letterboxd average.` }),
+        el('p', { text: `Last synced ${ago(lastSync)}. Each sync only fetches what changed.` }),
+      );
+      if (!prep) {
+        heading.textContent = 'Recommended by friends';
+        sortBar.classList.add('lfr-hidden');
+        grid.replaceChildren();
+        pager.replaceChildren();
+        note.replaceChildren(el('div', { class: 'lfr-empty' }, [
+          el('p', { text: 'Get film recommendations from the people you follow.' }),
+          el('p', { text: 'The first sync reads every film they’ve watched, once. It takes a few minutes; after that, only new activity is fetched.' }),
+          el('a', { href: '#', class: 'button -action button-green', 'data-lfr': 'first-sync', text: 'Sync now', onclick: (e) => { e.preventDefault(); sync(); } }),
+          syncStatus,
+        ]));
+        return;
+      }
+      sortBar.classList.remove('lfr-hidden');
+      const list = visible();
+      const left = strictActive(w) ? unchecked().length : 0;
+      const n = list.length;
+      heading.textContent = `Your friends recommend ${n.toLocaleString()}${left ? '+' : ''} ${n === 1 && !left ? 'film' : 'films'}`;
+      const end = page * P;
+      grid.replaceChildren(...list.slice(end - P, end).map(card));
+      renderPager(n, scanPaused && left > 0);
+      if (busyNote) note.replaceChildren(busyNote);
+      else if (scanPaused && left && n < end) {
+        note.replaceChildren(
+          `${left.toLocaleString()} of your friends’ films haven’t been checked against these filters yet. `,
+          el('button', { class: 'lfr-link', 'data-lfr': 'check-more', text: 'Check more films', onclick: () => refresh() }),
+        );
+      } else if (!n) {
+        note.replaceChildren(
+          el('div', { class: 'lfr-empty' }, ['No films match these filters. ', el('button', { class: 'lfr-link', text: 'Clear filters', onclick: clearFilters })]),
+        );
+      } else note.replaceChildren();
+    }
+
+    function clearFilters() {
+      FILTER_KEYS.forEach((k) => { w[k] = Array.isArray(DEFAULT_WEIGHTS[k]) ? [] : DEFAULT_WEIGHTS[k]; });
+      savePrefs(w);
+      resetPaging();
+      refresh();
+    }
+
+    async function sync() {
+      if (syncing) return;
+      syncing = true;
+      updateBusy();
+      const show = (s) => { syncLink.textContent = s; syncStatus.textContent = s; };
       try {
-        await syncAll(me, setStatus);
+        await syncAll(me, (s) => show(s.split(' · ')[0]));
         await load();
-        await rerank();
+        show('Sync friends’ films');
+        syncStatus.textContent = '';
+        await refresh();
       } catch (err) {
         console.error('[friend-recs]', err);
-        setStatus(`Sync stopped: ${err.message}. Synced follows are kept; run it again to continue.`);
-      } finally { syncBtn.disabled = false; }
-    });
+        show('Sync stopped. Try again');
+      } finally { syncing = false; updateBusy(); }
+    }
+    syncLink.addEventListener('click', (e) => { e.preventDefault(); sync(); });
 
-    await load();
-    render();
-    if (prep) await rerank();
-    else setStatus('Not synced yet.');
+    // Rebuild the whole page (used by "Reset to defaults" so sliders show the new values).
+    const rebuild = () => { root.dispatchEvent(new CustomEvent('lfr-rebuild')); };
+
+    const start = async () => {
+      await load();
+      await refresh();
+      if (prep && (!lastSync || Date.now() - lastSync > CFG.autoSyncHours * HOUR)) sync();
+    };
+    return { root, start, destroy: () => { token++; menus.forEach((m) => m.close()); root.remove(); } };
   }
 
+  // ---------- Routing + entry points ----------
+  function addNavEntries(me) {
+    const href = routeHref(me);
+    // Account menu in the header: after "Watchlist".
+    if (!document.querySelector('.lfr-subnav')) {
+      const wl = [...document.querySelectorAll('header ul.subnav a, .main-nav ul.subnav a')]
+        .find((a) => (a.getAttribute('href') || '').toLowerCase() === `/${me}/watchlist/`);
+      wl?.parentElement.after(el('li', { class: 'lfr-subnav' }, [el('a', { href, text: 'Friend recs' })]));
+    }
+    // Profile tabs, on your own profile only: after "Watchlist".
+    if (!document.querySelector('.lfr-navitem')) {
+      const tab = document.querySelector('.profile-navigation .navlist li.js-page-watchlist');
+      if (tab && (tab.dataset.owner || '').toLowerCase() === me) {
+        tab.after(el('li', { class: 'navitem lfr-navitem', 'data-owner': tab.dataset.owner }, [el('a', { class: 'navlink', href, text: 'Recs' })]));
+      }
+    }
+  }
+
+  let current = null, hostEl = null, prevTitle = '';
+  function setActiveTab(on) {
+    const ours = document.querySelector('.lfr-navitem');
+    const wl = document.querySelector('.profile-navigation .navlist li.js-page-watchlist');
+    ours?.classList.toggle('-active', on);
+    wl?.classList.toggle('-active', !on);
+  }
+  function enterRoute(me) {
+    if (current) return;
+    hostEl = document.querySelector('#content .cols-2') || null;
+    const mountPoint = hostEl?.parentElement || document.querySelector('#content .content-wrap') || document.querySelector('#content') || document.body;
+    const make = () => {
+      current = createPage(me);
+      current.root.addEventListener('lfr-rebuild', () => { current.destroy(); current = null; make(); });
+      if (hostEl) hostEl.after(current.root); else mountPoint.append(current.root);
+      current.start();
+    };
+    hostEl?.classList.add('lfr-hidden');
+    prevTitle = document.title;
+    document.title = 'Recommended by friends • Letterboxd';
+    setActiveTab(true);
+    make();
+  }
+  function leaveRoute() {
+    if (!current) return;
+    current.destroy();
+    current = null;
+    hostEl?.classList.remove('lfr-hidden');
+    document.title = prevTitle;
+    setActiveTab(false);
+  }
+
+  let mountedFor = null;
   function mount() {
     const me = detectMe();
     if (!me) return false;
-    if (document.querySelector('.lfr-btn')) return true;
+    if (mountedFor) return true;
+    mountedFor = me;
     document.head.append(el('style', { text: STYLE }));
-    document.body.append(el('button', { class: 'lfr-btn', type: 'button', text: '🎯 Friend recs', onclick: () => openApp(me) }));
+    addNavEntries(me);
+    // The header and profile tabs can be rendered after us; keep trying for a while.
+    const navTimer = setInterval(() => addNavEntries(me), 1000);
+    setTimeout(() => clearInterval(navTimer), 30000);
+    window.addEventListener('hashchange', () => { if (isRoute(me)) { addNavEntries(me); enterRoute(me); } else leaveRoute(); });
+    if (isRoute(me)) enterRoute(me);
     return true;
   }
-  // Retry until the page has finished filling in the signed-in user (up to 30 s; never appears when signed out).
+  // Retry until the page has finished filling in the signed-in user (up to 30 s; nothing happens when signed out).
   if (!mount()) {
     const timer = setInterval(() => { if (mount()) clearInterval(timer); }, 500);
     setTimeout(() => clearInterval(timer), 30000);

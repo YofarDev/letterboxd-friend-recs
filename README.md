@@ -8,12 +8,12 @@ It runs entirely in your browser, on letterboxd.com, while you're signed in. The
 
 ## Features
 
-- **Recommended** view: films your follows rated well, weighted by how closely their taste matches yours, how many of them watched it, and the global Letterboxd rating.
-- **Most watched by follows** view: plain count of how many people you follow watched each film, ratings ignored.
-- Films you've already watched are always excluded. Your watchlist can be shown, hidden, or used as the only source.
-- Filters: minimum length (hide shorts), films / series (miniseries), release year range, genre, exclude genre, country, language, minimum number of follows who watched it.
-- Each card shows the score, how many follows watched it, their average rating, the global rating, likes, and who watched it with their rating.
-- Every weight is a slider, and your settings are remembered.
+- A **Recs** tab in your profile, next to Watchlist, that looks and works like a regular Letterboxd page. "Friend recs" also appears in the account menu.
+- Sort by **Recommended** (films your follows rated well, weighted by how closely their taste matches yours, how many of them watched it, and the Letterboxd average), **Most watched by friends**, or **Friends' rating**.
+- Letterboxd-style filters: **Decade**, **Genre** (include or exclude several), **Country**, **Language**, and **Other** (films / series, hide shorts, include / hide / only your watchlist, minimum number of friends who watched it).
+- Films you've already watched are always excluded. Films on your watchlist are marked with a blue dot.
+- Under each poster: your friends' average rating and how many of them watched it. Hover a poster for who watched it and what they rated it.
+- Optional **Tune recommendations** panel in the sidebar, with sliders for the scoring weights. All settings are remembered.
 
 ## Install
 
@@ -21,8 +21,8 @@ It runs entirely in your browser, on letterboxd.com, while you're signed in. The
    - Chrome / Edge / Brave: [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/). In Chrome, Tampermonkey also needs **Allow User Scripts** turned on in `chrome://extensions` → Tampermonkey → Details (or **Developer mode** on older Chrome).
    - Firefox and forks (Zen, LibreWolf…): Tampermonkey or Violentmonkey.
 2. Open [`letterboxd-friend-recs.user.js`](letterboxd-friend-recs.user.js), click **Raw**, and let the manager install it. (Or create a new script and paste the file in.)
-3. Go to [letterboxd.com](https://letterboxd.com) while signed in. A green **🎯 Friend recs** button appears bottom left.
-4. Open it and click **Sync now**.
+3. Sign in to [letterboxd.com](https://letterboxd.com) and open your profile. A **Recs** tab appears after Watchlist (the page lives at `letterboxd.com/<you>/watchlist/#friend-recs`).
+4. Click **Sync now** once. The first sync takes a few minutes. After that, the page syncs in the background whenever the last sync is more than 12 hours old, or when you click **Sync friends' films** in the sidebar.
 
 ## How it works
 
@@ -63,18 +63,20 @@ For each film you haven't watched:
 4. **Bonus for how many follows watched it**, rated or not:
    `score = friendScore + β·ln(1 + n_watched)`
 
-`k`, `β`, `taste` and the like bonus are sliders on the results page.
+`taste`, `k`, `β` and the like bonus are the sliders under **Tune recommendations**.
 
 ### Filters
 
-Year is known for every film from the synced data, so that filter is instant. Length, film/series, genre, country and language come from each film's page:
+Decade is known for every film from the synced data, so that filter is instant. Length, film/series, genre, country and language come from each film's page:
 
 - **Length / type**: films whose details aren't loaded yet are shown until their details arrive. Most films pass, so this stays fast.
-- **Genre / country / language**: only films already checked are shown. When the page isn't full, the script checks the next best-ranked candidates, up to 300 per filter change, and then offers a **Check more films** button.
+- **Genre / country / language**: only films already checked are shown. When the page isn't full, the script checks the next best-ranked candidates (about 3 per second, with a live count), up to 300 per filter change, and then offers **Check more films**. Checked films are remembered, so the same filter is fast next time.
+
+Pages you've already paged past keep their order, so moving between pages never repeats or skips a film while new details re-rank the rest.
 
 ## Privacy
 
-- Everything stays in your browser: IndexedDB (`lbxFriendRecs`) and `localStorage` for your slider settings.
+- Everything stays in your browser: IndexedDB (`lbxFriendRecs`) and `localStorage` for your filters and settings.
 - The script only talks to `letterboxd.com`, and posters load from Letterboxd's own image CDN. Nothing is sent anywhere else.
 - To delete everything: browser devtools → Application/Storage → IndexedDB → `lbxFriendRecs` → Delete.
 
@@ -96,9 +98,9 @@ npm test        # end-to-end test in jsdom against a fake Letterboxd
 npm run lint
 ```
 
-The test loads the real userscript into a simulated page with fake follows and films, then checks the results page: default filters, genre / language / year / exclude-genre filters, the "Check more films" scan, and Clear filters.
+The test loads the real userscript into a simulated Letterboxd watchlist page with fake follows and films. It checks the Recs tab and account-menu entry, pagination with no repeats, the dropdown filters (genre include/exclude, language, decade, other), the "Check more films" scan, sorting, Clear filters, and leaving the page.
 
-Settings that aren't on the results page live in the `CFG` object at the top of the script.
+The page is built from Letterboxd's own CSS classes (`section-heading`, `sorting-selects` / `smenu-menu`, `poster-grid`, `pagination`, `actions-panel`), so it follows the site's styles. Settings that aren't on the page live in the `CFG` object at the top of the script.
 
 ### Known limits
 
